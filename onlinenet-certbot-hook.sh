@@ -73,7 +73,7 @@ function curl_get()
 	result=$(curl -s -X GET \
 	-H "Authorization: Bearer $ONLINE_NET_API_TOKEN" \
 	-H "X-Pretty-JSON: 1" \
-	$1)
+	https://api.online.net$1)
 
 	checkForError "$result"
 	echo "$result"
@@ -86,7 +86,7 @@ function curl_post()
 	-H "Authorization: Bearer $ONLINE_NET_API_TOKEN" \
 	-H "X-Pretty-JSON: 1" \
 	--data $2 \
-	$1)
+	https://api.online.net$1)
 
 	checkForError "$result"
 	echo "$result"
@@ -98,7 +98,7 @@ function curl_delete()
 	result=$(curl -s -X DELETE \
 	-H "Authorization: Bearer $ONLINE_NET_API_TOKEN" \
 	-H "X-Pretty-JSON: 1" \
-	$1)
+	https://api.online.net$1)
 
 	checkForError "$result"
 	echo "$result"
@@ -110,7 +110,7 @@ function curl_patch()
 	result=$(curl -s -X PATCH \
 	-H "Authorization: Bearer $ONLINE_NET_API_TOKEN" \
 	-H "X-Pretty-JSON: 1" \
-	$1)
+	https://api.online.net$1)
 
 	checkForError "$result"
 	echo "$result"
@@ -160,7 +160,7 @@ fi
 echo "Starting certificate validation on domain: $DOMAIN and sub-domain: $SUB_DOMAIN"
 
 # Get the data of all current domains.
-domain_data=$(curl_get "https://api.online.net/api/v1/domain/")
+domain_data=$(curl_get "/api/v1/domain/")
 echo_debug "Domain Data: $domain_data"
 
 # Get the ID of the domain we are interested in editing.
@@ -168,8 +168,12 @@ domain_id=$(echo "$domain_data" | jq -c '.[] | select( .name | contains("'${DOMA
 echo_debug "Domain ID: $domain_id"
 check_exists "$domain_id"
 
+ref_domain_versions=$(echo "$domain_data" | jq -c '.[] | select( .name | contains("'${DOMAIN}'"))' | jq -r '.versions' | jq -r '.["$ref"]')
+echo_debug "Ref Domain Versions: $ref_domain_versions"
+check_exists "$ref_domain_versions"
+
 # Get the DNS zone versions of this domain.
-domain_versions=$(curl_get "https://api.online.net/api/v1/domain/$domain_id/version")
+domain_versions=$(curl_get "$ref_domain_versions")
 echo_debug "Domain Versions: $domain_versions"
 
 # Find the active DNS zone version of all the versions.
@@ -180,36 +184,40 @@ check_exists "$domain_active_version"
 # Get the UUID and Name of the active DNS zone version so we can progress further.
 version_uuid=$(echo "$domain_active_version" | jq -r ".uuid_ref")
 version_name=$(echo "$domain_active_version" | jq -r ".name")
+ref_zone_data=$(echo "$domain_active_version" | jq -r ".zone" | jq -r '.["$ref"]')
 echo_debug "Active Version UUID: $version_uuid"
 check_exists "$version_uuid"
 echo_debug "Active Version Name: $version_name"
 check_exists "$version_name"
+echo_debug "Ref Zone Data: $ref_zone_data"
+check_exists "$ref_zone_data"
 
 # Get the data of all domains (like domain names, types, ttl, etc)
-zone_data=$(curl_get "https://api.online.net/api/v1/domain/$domain_id/version/$version_uuid/zone")
+zone_data=$(curl_get "$ref_zone_data")
 echo_debug "Zone Data: $zone_data"
 
 # Now it is time to create a new DNS zone version where we are going to add the acme-challenge domain name.
 # This is done because we cannot edit the currently active DNS zone.
 echo "Creating new DNS zone version..."
-version_create_result=$(curl_post "https://api.online.net/api/v1/domain/$domain_id/version" \
-									"name=deleteme_acme_challenge_of_$version_name")
+version_create_result=$(curl_post "$ref_domain_versions" "name=deleteme_acme_challenge_of_$version_name")
 echo_debug "Version create result: $version_create_result"
 
 # Get the UUID and Name of the newly created DNS zone version which will contain the acme-challenge.
 acme_version_uuid=$(echo "$version_create_result" | jq -r ".uuid_ref")
 acme_version_name=$(echo "$version_create_result" | jq -r ".name")
+ref_acme_zone_data=$(echo "$version_create_result" | jq -r ".zone" | jq -r '.["$ref"]')
 echo_debug "Acme Version UUID: $acme_version_uuid"
 check_exists "$acme_version_uuid"
 echo_debug "Acme Version Name: $acme_version_name"
 check_exists "$acme_version_name"
+echo_debug "Ref Acme Zone Data: $ref_acme_zone_data"
+check_exists "$ref_acme_zone_data"
 echo "Created a new version with name: $acme_version_name and uuid: $acme_version_uuid"
 
 # Now create the acme-challenge sub-domain which will contain a TXT data with the token provided by the certbot.
 # Letsencrypt is going to check the data of this sub-domain and verify that its token is there.
 echo "Creating the acme-challenge sub-domain with name: $HOST"
-subdomain_create_result=$(curl_post "https://api.online.net/api/v1/domain/$domain_id/version/$acme_version_uuid/zone" \
-												"name=$HOST&type=TXT&priority=1&ttl=600&data=$CERTBOT_VALIDATION")
+subdomain_create_result=$(curl_post "$ref_acme_zone_data" "name=$HOST&type=TXT&priority=1&ttl=600&data=$CERTBOT_VALIDATION")
 echo_debug "Sub-domain create result: $subdomain_create_result"
 
 # Get the name and data of the newly created sub-domain and confirm they match.
@@ -244,15 +252,14 @@ do
 	fi
 
 	echo_debug "Copying domain entry: name [$name] type [$type] priority [$priority] ttl [$ttl] data [$data]"
-	subdomain_copy_result=$(curl_post "https://api.online.net/api/v1/domain/$domain_id/version/$acme_version_uuid/zone" \
-												"name=$name&type=$type&priority=$priority&ttl=$ttl&data=$data")
+	subdomain_copy_result=$(curl_post "$ref_acme_zone_data" "name=$name&type=$type&priority=$priority&ttl=$ttl&data=$data")
 	echo_debug "Sub-domain copy result: $subdomain_copy_result"
 done
 
 # After we've copied everything into the acme-challenge dns zone, its time to activate it (effectively disabling the previous one)
 echo "Activating the acme-challenge DNS zone..."
 echo "WARNING: If anything from this point onwards fails, you have to manually activate your old DNS zone."
-acme_version_enable_result=$(curl_patch "https://api.online.net/api/v1/domain/$domain_id/version/$acme_version_uuid/enable")
+acme_version_enable_result=$(curl_patch "$ref_domain_versions/$acme_version_uuid/enable")
 echo_debug "Acme-challenge DNS zone version enable result: $acme_version_enable_result"
 
 # A successful enable should return nothing.
@@ -274,7 +281,7 @@ sleep 60
 # After hopefully letsencrypt has verified its token, its time for us to re-activate our previous active DNS zone.
 echo "Re-activating your old active DNS zone: $version_name"
 echo "WARNING: If re-activating fails, you have to manually activate your DNS zone!"
-version_enable_result=$(curl_patch "https://api.online.net/api/v1/domain/$domain_id/version/$version_uuid/enable")
+version_enable_result=$(curl_patch "$ref_domain_versions/$version_uuid/enable")
 echo_debug "Re-activate old active DNS zone version result: $version_enable_result"
 
 # A successful enable should return nothing.
@@ -293,7 +300,7 @@ fi
 if $DELETE_ACME_ZONE_VERSION;
 then
 	echo "Acme-challenge DNS zone version is set to be automatically deleted. Deleting..."
-	acme_version_delete_result=$(curl_delete "https://api.online.net/api/v1/domain/$domain_id/version/$acme_version_uuid")
+	acme_version_delete_result=$(curl_delete "$ref_domain_versions/$acme_version_uuid")
 
 	echo_debug "Acme DNS zone version delete result: $acme_version_delete_result"
 
